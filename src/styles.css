@@ -1,0 +1,364 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  convertWeightForDisplay,
+  convertWeightForStorage,
+  formatDate,
+  formatWeight,
+  getChartPoints,
+  loadEntries,
+  loadTargetWeight,
+  loadUnit,
+  saveEntries,
+  saveTargetWeight,
+  saveUnit,
+  formatDateForInput,
+} from './utils/storage';
+
+const emptyForm = () => ({
+  date: formatDateForInput(),
+  weight: '',
+  notes: '',
+});
+
+const defaultEntries = [
+  { id: 'seed-1', date: '2025-01-05', weight: 200, notes: 'Started tracking' },
+  { id: 'seed-2', date: '2025-01-20', weight: 193, notes: 'Feeling better' },
+  { id: 'seed-3', date: '2025-02-10', weight: 186, notes: 'Strong week' },
+  { id: 'seed-4', date: '2025-02-25', weight: 178, notes: 'Steady progress' },
+];
+
+function App() {
+  const [entries, setEntries] = useState(() => {
+    const stored = loadEntries();
+    return stored.length ? stored : defaultEntries;
+  });
+  const [unit, setUnit] = useState(loadUnit);
+  const [targetWeight, setTargetWeight] = useState(loadTargetWeight);
+  const [form, setForm] = useState(emptyForm());
+  const [editingId, setEditingId] = useState(null);
+  const [installPrompt, setInstallPrompt] = useState(null);
+  const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    saveEntries(entries);
+  }, [entries]);
+
+  useEffect(() => {
+    saveTargetWeight(targetWeight);
+  }, [targetWeight]);
+
+  useEffect(() => {
+    saveUnit(unit);
+  }, [unit]);
+
+  useEffect(() => {
+    const onBeforeInstallPrompt = (event) => {
+      event.preventDefault();
+      setInstallPrompt(event);
+    };
+
+    window.addEventListener('beforeinstallprompt', onBeforeInstallPrompt);
+
+    return () => {
+      window.removeEventListener('beforeinstallprompt', onBeforeInstallPrompt);
+    };
+  }, []);
+
+  const sortedEntries = useMemo(
+    () => [...entries].sort((a, b) => new Date(a.date) - new Date(b.date)),
+    [entries]
+  );
+
+  const latestEntry = sortedEntries.at(-1) ?? null;
+  const startingEntry = sortedEntries[0] ?? null;
+
+  const currentWeight = latestEntry ? convertWeightForDisplay(latestEntry.weight, unit) : 0;
+  const startingWeight = startingEntry ? convertWeightForDisplay(startingEntry.weight, unit) : 0;
+  const totalLossNeeded = Math.max(startingWeight - targetWeight, 0);
+  const lossSoFar = startingEntry && latestEntry ? Math.max(startingWeight - currentWeight, 0) : 0;
+  const progressPercent = totalLossNeeded > 0 ? Math.min((lossSoFar / totalLossNeeded) * 100, 100) : 100;
+
+  const chartPoints = useMemo(() => getChartPoints(sortedEntries, unit), [sortedEntries, unit]);
+
+  const handleChange = (event) => {
+    const { name, value } = event.target;
+    setForm((current) => ({ ...current, [name]: value }));
+  };
+
+  const resetForm = () => {
+    setForm(emptyForm());
+    setEditingId(null);
+  };
+
+  const handleSubmit = (event) => {
+    event.preventDefault();
+
+    const weightValue = Number(form.weight);
+    if (!form.date || !Number.isFinite(weightValue) || weightValue <= 0) {
+      return;
+    }
+
+    const normalizedWeight = convertWeightForStorage(weightValue, unit);
+    const preparedEntry = {
+      id: editingId ?? crypto.randomUUID(),
+      date: form.date,
+      weight: normalizedWeight,
+      notes: form.notes.trim(),
+    };
+
+    if (editingId) {
+      setEntries((current) => current.map((entry) => (entry.id === editingId ? preparedEntry : entry)));
+    } else {
+      setEntries((current) => [...current, preparedEntry]);
+    }
+
+    resetForm();
+  };
+
+  const handleEdit = (entry) => {
+    setEditingId(entry.id);
+    setForm({
+      date: entry.date,
+      weight: String(convertWeightForDisplay(entry.weight, unit)),
+      notes: entry.notes ?? '',
+    });
+  };
+
+  const handleDelete = (id) => {
+    setEntries((current) => current.filter((entry) => entry.id !== id));
+    if (editingId === id) {
+      resetForm();
+    }
+  };
+
+  const handleExport = () => {
+    const rows = [
+      ['date', 'weight', 'notes'],
+      ...entries.map((entry) => [entry.date, convertWeightForDisplay(entry.weight, unit), entry.notes ?? '']),
+    ];
+
+    const csv = rows
+      .map((row) => row.map((value) => `"${String(value).replace(/"/g, '""')}"`).join(','))
+      .join('\n');
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'weight-loss-log.csv';
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImport = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (loadEvent) => {
+      const text = String(loadEvent.target?.result ?? '');
+      const lines = text.split(/\r?\n/).filter(Boolean);
+      if (lines.length < 2) return;
+
+      const parsedEntries = lines.slice(1).map((line) => {
+        const [date, rawWeight, ...rest] = line.split(',');
+        const notes = rest.join(',').replace(/^"|"$/g, '').replace(/""/g, '"');
+        const weight = Number(rawWeight?.replace(/"/g, '') ?? 0);
+        if (!date || !Number.isFinite(weight) || weight <= 0) return null;
+        return {
+          id: crypto.randomUUID(),
+          date,
+          weight: convertWeightForStorage(weight, unit),
+          notes,
+        };
+      }).filter(Boolean);
+
+      if (!parsedEntries.length) return;
+      setEntries((current) => [...current, ...parsedEntries]);
+      event.target.value = '';
+    };
+
+    reader.readAsText(file);
+  };
+
+  const handleInstall = async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    await installPrompt.userChoice;
+    setInstallPrompt(null);
+  };
+
+  const chartHeight = 180;
+  const chartWidth = 520;
+  const chartPath = chartPoints.length
+    ? chartPoints
+        .map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x * 5.2},${point.y * 1.8}`)
+        .join(' ')
+    : '';
+
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <div>
+          <p className="eyebrow">Personal wellness</p>
+          <h1>Flow Weight</h1>
+        </div>
+
+        <div className="header-actions">
+          <button type="button" className="ghost-button" onClick={() => setUnit((current) => (current === 'lb' ? 'kg' : 'lb'))}>
+            {unit === 'lb' ? 'Switch to kg' : 'Switch to lb'}
+          </button>
+          {installPrompt && (
+            <button type="button" className="primary-button" onClick={handleInstall}>
+              Install app
+            </button>
+          )}
+        </div>
+      </header>
+
+      <main className="dashboard">
+        <section className="panel summary-grid">
+          <div className="metric-card accent">
+            <span>Current</span>
+            <strong>{formatWeight(currentWeight, unit)}</strong>
+          </div>
+
+          <div className="metric-card">
+            <span>Target</span>
+            <strong>{formatWeight(targetWeight, unit)}</strong>
+          </div>
+
+          <div className="metric-card">
+            <span>Lost</span>
+            <strong>{formatWeight(lossSoFar, unit)}</strong>
+          </div>
+
+          <div className="metric-card">
+            <span>Progress</span>
+            <strong>{Math.round(progressPercent)}%</strong>
+          </div>
+        </section>
+
+        <section className="panel chart-panel">
+          <div className="section-header">
+            <div>
+              <p className="eyebrow">Trend</p>
+              <h2>Weight over time</h2>
+            </div>
+            <label className="target-input">
+              Target weight
+              <input
+                type="number"
+                min="80"
+                max="300"
+                step="0.1"
+                value={targetWeight}
+                onChange={(event) => setTargetWeight(Number(event.target.value) || 0)}
+              />
+            </label>
+          </div>
+
+          <svg viewBox={`0 0 ${chartWidth} ${chartHeight}`} className="chart" aria-label="Weight history chart">
+            <path d={chartPath} className="chart-line" />
+            {chartPoints.map((point) => (
+              <circle key={point.id} cx={point.x * 5.2} cy={point.y * 1.8} r="4" className="chart-point" />
+            ))}
+          </svg>
+        </section>
+
+        <section className="content-grid">
+          <div className="panel form-panel">
+            <div className="section-header compact">
+              <div>
+                <p className="eyebrow">Log</p>
+                <h2>{editingId ? 'Edit entry' : 'Add new entry'}</h2>
+              </div>
+              {editingId && (
+                <button type="button" className="link-button" onClick={resetForm}>
+                  Cancel
+                </button>
+              )}
+            </div>
+
+            <form onSubmit={handleSubmit} className="entry-form">
+              <label>
+                Date
+                <input type="date" name="date" value={form.date} onChange={handleChange} />
+              </label>
+
+              <label>
+                Weight ({unit})
+                <input
+                  type="number"
+                  name="weight"
+                  min="0"
+                  step="0.1"
+                  placeholder={unit === 'lb' ? '176.5' : '80.0'}
+                  value={form.weight}
+                  onChange={handleChange}
+                />
+              </label>
+
+              <label>
+                Notes
+                <textarea name="notes" value={form.notes} onChange={handleChange} rows="3" placeholder="Felt strong today" />
+              </label>
+
+              <div className="form-actions">
+                <button type="submit" className="primary-button">
+                  {editingId ? 'Save changes' : 'Add entry'}
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <div className="panel list-panel">
+            <div className="section-header compact">
+              <div>
+                <p className="eyebrow">History</p>
+                <h2>Recent entries</h2>
+              </div>
+              <div className="list-actions">
+                <button type="button" className="ghost-button" onClick={handleExport}>
+                  Export CSV
+                </button>
+                <button type="button" className="ghost-button" onClick={() => fileInputRef.current?.click()}>
+                  Import CSV
+                </button>
+                <input ref={fileInputRef} hidden type="file" accept=".csv" onChange={handleImport} />
+              </div>
+            </div>
+
+            {sortedEntries.length === 0 ? (
+              <p className="empty-state">No weights logged yet. Add your first entry to start tracking.</p>
+            ) : (
+              <ul className="entry-list">
+                {[...sortedEntries].reverse().map((entry) => (
+                  <li key={entry.id} className="entry-item">
+                    <div>
+                      <strong>{formatDate(entry.date)}</strong>
+                      <p>{entry.notes || 'No notes'}</p>
+                    </div>
+                    <div className="entry-meta">
+                      <span>{formatWeight(convertWeightForDisplay(entry.weight, unit), unit)}</span>
+                      <div className="mini-actions">
+                        <button type="button" className="link-button" onClick={() => handleEdit(entry)}>
+                          Edit
+                        </button>
+                        <button type="button" className="link-button danger" onClick={() => handleDelete(entry.id)}>
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </section>
+      </main>
+    </div>
+  );
+}
+
+export default App;
